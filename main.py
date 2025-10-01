@@ -4,12 +4,14 @@ import random
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, PollAnswer
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,24 +19,28 @@ load_dotenv()
 WELCOME_TEXT = (
     "Здравствуй, дорогой друг! Бот создан для того, чтобы нести людям тепло, заботу, преодолевать одиночество и помогать в трудных ситуациях."
     "\n\nКоманды:\n"
-    "/join — участвовать в подборе пар\n"
-    "/leave — выйти из подбора\n"
-    "/status — список участников\n"
-    "/pair — собрать пары (только для админов чата)\n"
+    "/join — участвовать в подборе пар (можно и без этого: по понедельникам приходит опрос)\n"
+    "/leave — выйти из подбора (на эту неделю)\n"
+    "/status — список участников, готовых на этой неделе\n"
+    "/pair — собрать пары (для админов чата)\n"
+    "/poll_now — запустить опрос сейчас (для админов чата)\n"
     "/help — помощь\n\n"
-    "Политика: храним только минимальные технические данные, необходимые для работы. Для удаления своих данных — команда /delete_me."
+    "Каждый понедельник в 15:00 (МСК) бот пришлёт опрос ‘Кто готов участвовать на этой неделе?’. Отметь ‘Готов’, чтобы попасть в рандом на этой неделе.\n"
+    "Приватность: храним только минимальные технические данные. /delete_me — удалить свои данные."
 )
 
 DB_PATH = os.getenv("DB_PATH", "pairbot.sqlite3")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ROUNDS_TO_AVOID = int(os.getenv("ROUNDS_TO_AVOID", "5"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "2000"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)  # Telegram user_id владельца бота
 
 if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN не найден. Укажи его в .env")
+    raise SystemExit("BOT_TOKEN не найден. Укажи его в .env/Secrets")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Moscow"))
 
 # ---------------- DB -----------------
 
@@ -64,6 +70,7 @@ def init_db():
                 chat_id INTEGER,
                 user_id INTEGER,
                 joined INTEGER DEFAULT 0,
+                weekly_ready INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             );
             """
@@ -87,6 +94,29 @@ def init_db():
             );
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS polls (
+                poll_id TEXT PRIMARY KEY,
+                chat_id INTEGER,
+                created_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT,
+                created_at TEXT
+            );
+            """
+        )
+        # На случай обновления старой БД — добавим недостающую колонку
+        try:
+            conn.execute("ALTER TABLE chat_members ADD COLUMN weekly_ready INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
@@ -121,10 +151,32 @@ def set_join(chat_id: int, user_id: int, joined: bool):
         conn.commit()
 
 
-def get_joined_user_ids(chat_id: int) -> list[int]:
+def set_ready(chat_id: int, user_id: int, ready: bool):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_members(chat_id, user_id, joined, weekly_ready) VALUES(?,?,0,0)",
+            (chat_id, user_id),
+        )
+        conn.execute(
+            "UPDATE chat_members SET weekly_ready=? WHERE chat_id=? AND user_id=?",
+            (1 if ready else 0, chat_id, user_id),
+        )
+        conn.commit()
+
+
+def reset_weekly_ready(chat_id: int | None = None):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        if chat_id is None:
+            conn.execute("UPDATE chat_members SET weekly_ready=0")
+        else:
+            conn.execute("UPDATE chat_members SET weekly_ready=0 WHERE chat_id=?", (chat_id,))
+        conn.commit()
+
+
+def get_ready_user_ids(chat_id: int) -> list[int]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            "SELECT user_id FROM chat_members WHERE chat_id=? AND joined=1",
+            "SELECT user_id FROM chat_members WHERE chat_id=? AND weekly_ready=1",
             (chat_id,),
         )
         return [row[0] for row in cur.fetchall()]
@@ -152,16 +204,13 @@ def record_round(chat_id: int, pairs_list: list[tuple[int, ...]]) -> int:
 
 def get_recent_pair_edges(chat_id: int, k: int) -> set[frozenset[int]]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        # получим id последних k раундов
         cur2 = conn.execute(
             "SELECT id FROM rounds WHERE chat_id=? ORDER BY id DESC LIMIT ?",
             (chat_id, k),
         )
         last_round_ids = [row[0] for row in cur2.fetchall()]
-
         if not last_round_ids:
             return set()
-
         placeholders = ",".join(["?"] * len(last_round_ids))
         cur3 = conn.execute(
             f"SELECT a,b,c FROM pairs WHERE round_id IN ({placeholders})",
@@ -171,7 +220,7 @@ def get_recent_pair_edges(chat_id: int, k: int) -> set[frozenset[int]]:
         for a, b, c in cur3.fetchall():
             if a and b:
                 edges.add(frozenset({a, b}))
-            if c:  # для трио — все попарные связи
+            if c:
                 edges.add(frozenset({a, c}))
                 edges.add(frozenset({b, c}))
         return edges
@@ -179,7 +228,7 @@ def get_recent_pair_edges(chat_id: int, k: int) -> set[frozenset[int]]:
 
 # ------------- pairing logic -------------
 
-def make_pairs(user_ids: list[int], recent_edges: set[frozenset[int]], max_attempts: int = 2000):
+def make_pairs(user_ids: list[int], recent_edges: set[frozenset[int]], max_attempts: int = MAX_ATTEMPTS):
     if len(user_ids) < 2:
         return []
 
@@ -192,14 +241,12 @@ def make_pairs(user_ids: list[int], recent_edges: set[frozenset[int]], max_attem
         triad = None
         pool = ids[:]
 
-        if len(pool) % 2 == 1:
-            # сделаем одно трио — возьмём 3 последних
+        if len(pool) % 2 == 1 and len(pool) >= 3:
             triad = tuple(pool[-3:])
             pool = pool[:-3]
 
         pairs = []
         ok = True
-        # соберём пары попарно
         for i in range(0, len(pool), 2):
             a, b = pool[i], pool[i + 1]
             if frozenset({a, b}) in recent_edges:
@@ -218,15 +265,13 @@ def make_pairs(user_ids: list[int], recent_edges: set[frozenset[int]], max_attem
                 ok = False
 
         if ok:
-            result = pairs + ([triad] if triad else [])
-            return result  # без конфликтов
+            return pairs + ([triad] if triad else [])
 
-        # иначе — посчитаем конфликты и сохраним лучшую попытку
         conflicts = 0
         tmp_pairs = []
         pool2 = ids[:]
         tri2 = None
-        if len(pool2) % 2 == 1:
+        if len(pool2) % 2 == 1 and len(pool2) >= 3:
             tri2 = tuple(pool2[-3:])
             pool2 = pool2[:-3]
         for i in range(0, len(pool2), 2):
@@ -245,7 +290,7 @@ def make_pairs(user_ids: list[int], recent_edges: set[frozenset[int]], max_attem
             if best_conflicts == 0:
                 return best_solution
 
-    return best_solution  # может содержать минимально возможные повторы
+    return best_solution
 
 
 # ------------- helpers -------------
@@ -263,11 +308,14 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
         status = getattr(member, "status", None)
         if not status:
             return False
-        # В aiogram 3 статусы — Enum, но на всякий случай сравниваем по строке
         status_val = str(status).lower()
         return any(s in status_val for s in ("creator", "owner", "administrator"))
     except TelegramBadRequest:
         return False
+
+
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID and user_id == OWNER_ID
 
 
 def mention(user_id: int, username: str | None, first_name: str | None) -> str:
@@ -277,15 +325,127 @@ def mention(user_id: int, username: str | None, first_name: str | None) -> str:
     return f"<a href=\"tg://user?id={user_id}\">{name}</a>"
 
 
+# ------------- weekly poll helpers -------------
+
+async def send_weekly_poll_to_chat(chat_id: int) -> bool:
+    """Отправляем опрос в указанный чат и сохраняем poll_id."""
+    question = "Кто готов участвовать на этой неделе?"
+    options = ["Готов", "Не готов"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        msg = await bot.send_poll(
+            chat_id=chat_id,
+            question=question,
+            options=options,
+            is_anonymous=False,
+            allows_multiple_answers=False,
+        )
+        poll_id = msg.poll.id if msg and msg.poll else None
+        if poll_id:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO polls(poll_id, chat_id, created_at) VALUES(?,?,?)",
+                    (poll_id, chat_id, now_iso),
+                )
+                conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+async def weekly_poll_job():
+    """Еженедельный опрос по всем чатам: понедельник 15:00 (МСК)."""
+    # Сбросим готовность на новую неделю по всем чатам
+    reset_weekly_ready(None)
+    # Список чатов
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT chat_id FROM chats")
+        chat_ids = [row[0] for row in cur.fetchall()]
+    # Рассылка опроса по каждому чату
+    for chat_id in chat_ids:
+        await send_weekly_poll_to_chat(chat_id)
+
+
 # ------------- handlers -------------
+
+@dp.my_chat_member()
+async def on_my_chat_member(event):
+    """Приветствуем, когда бота добавили в группу, и запоминаем чат."""
+    try:
+        new_status = str(getattr(event.new_chat_member, "status", "")).lower()
+    except Exception:
+        new_status = ""
+    if new_status in ("member", "administrator"):
+        chat_id = event.chat.id
+        upsert_chat(chat_id, getattr(event.chat, "title", ""))
+        welcome = (
+            "Здравствуй, дорогой друг! Я буду помогать знакомиться и поддерживать друг друга.\n\n"
+            "Каждый понедельник в 15:00 (МСК) я пришлю опрос: ‘Готов/Не готов’. Отметь ‘Готов’, чтобы участвовать на этой неделе.\n"
+            "Команды: /status, /pair (для админов), /poll_now (сразу опрос), /leave, /help."
+        )
+        try:
+            await bot.send_message(chat_id, welcome)
+        except Exception:
+            pass
+
+
+@dp.message(Command("poll_now"))
+async def cmd_poll_now(message: Message):
+    """Запускает опрос немедленно в текущем чате (для админов)."""
+    if not await ensure_group(message):
+        return
+    if not await is_admin(message.chat.id, message.from_user.id):
+        await message.answer("Только администратор чата может запускать опрос.")
+        return
+    # Сбрасываем отметки готовности только для этого чата и запускаем опрос
+    reset_weekly_ready(message.chat.id)
+    ok = await send_weekly_poll_to_chat(message.chat.id)
+    if ok:
+        await message.answer("Опрос отправлен в этот чат.")
+    else:
+        await message.answer("Не удалось отправить опрос. Проверьте права бота.")
+
+
+@dp.poll_answer()
+async def on_poll_answer(poll_answer: PollAnswer):
+    """Фиксируем готовность на неделю по ответу опроса."""
+    poll_id = poll_answer.poll_id
+    user = poll_answer.user
+    option_ids = poll_answer.option_ids or []
+    ready = len(option_ids) > 0 and option_ids[0] == 0  # 0 = "Готов"
+
+    # найдём чат по poll_id
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT chat_id FROM polls WHERE poll_id=?", (poll_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+        chat_id = row[0]
+
+    upsert_member(user)
+    if ready:
+        set_join(chat_id, user.id, True)  # если человек впервые, считаем его участником
+    set_ready(chat_id, user.id, ready)
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     upsert_member(message.from_user)
     await message.answer(
-        "Привет! Я бот для случайного составления пар в группах. Добавь меня в групповой чат и используй /join, /pair.\n\n" + WELCOME_TEXT,
+        "Привет! Я бот для случайного составления пар в группах. Добавь меня в групповой чат и используй /status, /pair.\n\n" + WELCOME_TEXT,
         disable_web_page_preview=True,
     )
+
+
+@dp.message(Command("whoami"))
+async def cmd_whoami(message: Message):
+    yours = message.from_user.id
+    info = [f"Твой user_id: {yours}"]
+    if OWNER_ID:
+        info.append("OWNER_ID настроен" if OWNER_ID == yours else f"OWNER_ID в боте = {OWNER_ID}")
+    else:
+        info.append("OWNER_ID не задан. Добавь в Secrets переменную OWNER_ID, чтобы рассылать объявления во все чаты.")
+    await message.answer("\n".join(info))
 
 
 @dp.message(Command("help"))
@@ -312,6 +472,7 @@ async def cmd_join(message: Message):
     upsert_chat(message.chat.id, message.chat.title)
     upsert_member(message.from_user)
     set_join(message.chat.id, message.from_user.id, True)
+    set_ready(message.chat.id, message.from_user.id, True)  # сразу считаем готовым до ближайшего сброса
     await message.answer("Готово! Ты участвуешь в подборе пар. ✨")
 
 
@@ -319,19 +480,18 @@ async def cmd_join(message: Message):
 async def cmd_leave(message: Message):
     if not await ensure_group(message):
         return
-    set_join(message.chat.id, message.from_user.id, False)
-    await message.answer("Ок, исключаю из подбора пар. Возвращайся через /join!")
+    set_ready(message.chat.id, message.from_user.id, False)
+    await message.answer("Ок, исключаю из подбора пар на эту неделю. Возвращайся через опрос или /join!")
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     if not await ensure_group(message):
         return
-    user_ids = get_joined_user_ids(message.chat.id)
+    user_ids = get_ready_user_ids(message.chat.id)
     if not user_ids:
-        await message.answer("Сейчас в пуле никого нет. Используйте /join в этом чате.")
+        await message.answer("На этой неделе пока никто не отметил ‘Готов’. Дождитесь опроса по понедельникам в 15:00 (МСК) или используйте /join.")
         return
-    # загрузим имена
     mentions = []
     with closing(sqlite3.connect(DB_PATH)) as conn:
         placeholders = ",".join(["?"] * len(user_ids))
@@ -341,7 +501,7 @@ async def cmd_status(message: Message):
         )
         for uid, uname, fname in cur.fetchall():
             mentions.append(mention(uid, uname, fname))
-    await message.answer(f"В пуле ({len(user_ids)}):\n" + ", ".join(mentions), parse_mode="HTML")
+    await message.answer(f"Готовы на этой неделе ({len(user_ids)}):\n" + ", ".join(mentions), parse_mode="HTML")
 
 
 @dp.message(Command("pair"))
@@ -352,9 +512,9 @@ async def cmd_pair(message: Message):
         await message.answer("Только администратор чата может запускать подбор пар.")
         return
 
-    user_ids = get_joined_user_ids(message.chat.id)
+    user_ids = get_ready_user_ids(message.chat.id)
     if len(user_ids) < 2:
-        await message.answer("Недостаточно участников для пар. Нужно хотя бы 2, лучше 4+.")
+        await message.answer("Недостаточно участников ‘Готов’ на этой неделе. Нужно хотя бы 2.")
         return
 
     recent = get_recent_pair_edges(message.chat.id, ROUNDS_TO_AVOID)
@@ -363,10 +523,8 @@ async def cmd_pair(message: Message):
         await message.answer("Не удалось собрать пары. Попробуй ещё раз /pair.")
         return
 
-    # сохраним раунд
     round_id = record_round(message.chat.id, solution)
 
-    # подгрузим имена для упоминаний
     id_set = {uid for tup in solution for uid in tup}
     users_map = {}
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -378,8 +536,7 @@ async def cmd_pair(message: Message):
         for uid, uname, fname in cur.fetchall():
             users_map[uid] = (uname, fname)
 
-    # Сообщение с парами/трио (свободный стиль)
-    lines = ["💫 Пары дня готовы! (Раунд #{}).".format(round_id)]
+    lines = ["💫 Пары недели готовы! (Раунд #{}).".format(round_id)]
     for tpl in solution:
         if len(tpl) == 2:
             a, b = tpl
@@ -393,12 +550,107 @@ async def cmd_pair(message: Message):
             c_m = mention(c, *users_map.get(c, (None, None)))
             lines.append(f"— {a_m} 🤝 {b_m} 🤝 {c_m} (трио)")
 
-    lines.append("\nПожелание от бота: будьте бережны друг к другу. Делитесь теплом и поддержкой. 🫶")
+    lines.append("\nПусть эта неделя будет тёплой и поддерживающей. 🫶")
     await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+# -------- Объявления: ТОЛЬКО владелец бота (OWNER_ID) --------
+
+@dp.message(Command("ad_add"))
+async def cmd_ad_add(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /ad_add текст объявления (доступно только владельцу)")
+        return
+    text = parts[1].strip()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            "INSERT INTO ads(text, created_at) VALUES(?,?)",
+            (text, datetime.now(timezone.utc).isoformat()),
+        )
+        ad_id = cur.lastrowid
+        conn.commit()
+    await message.answer(f"Добавлено объявление #{ad_id} (глобально).")
+
+
+@dp.message(Command("ad_list"))
+async def cmd_ad_list(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute("SELECT id, text, created_at FROM ads ORDER BY id")
+        rows = cur.fetchall()
+    if not rows:
+        await message.answer("Объявлений пока нет. Добавь через /ad_add <текст>.")
+        return
+    lines = ["Сохранённые объявления (глобально):"]
+    for i, t, ts in rows:
+        t_short = (t[:160] + "…") if len(t) > 160 else t
+        lines.append(f"#{i} — {t_short}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("ad_delete"))
+async def cmd_ad_delete(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = message.text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("Использование: /ad_delete <id>")
+        return
+    ad_id = int(parts[1].strip())
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM ads WHERE id=?", (ad_id,))
+        conn.commit()
+    await message.answer(f"Удалено (если существовало) объявление #{ad_id}.")
+
+
+@dp.message(Command("ad_send"))
+async def cmd_ad_send(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    # /ad_send [id]
+    parts = message.text.split(" ", 1)
+    ad_id = None
+    if len(parts) > 1 and parts[1].strip().isdigit():
+        ad_id = int(parts[1].strip())
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        if ad_id is not None:
+            cur = conn.execute("SELECT text FROM ads WHERE id=?", (ad_id,))
+            row = cur.fetchone()
+            if not row:
+                await message.answer("Нет объявления с таким id.")
+                return
+            (text,) = row
+        else:
+            cur = conn.execute("SELECT text FROM ads ORDER BY RANDOM() LIMIT 1")
+            row = conn.fetchone()
+            if not row:
+                await message.answer("Объявлений пока нет. Добавь через /ad_add <текст>.")
+                return
+            (text,) = row
+
+        cur = conn.execute("SELECT chat_id FROM chats")
+        chat_ids = [r[0] for r in cur.fetchall()]
+
+    ok, fail = 0, 0
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id, text, disable_web_page_preview=False)
+            ok += 1
+        except Exception:
+            fail += 1
+    await message.answer(f"Объявление отправлено. Успех: {ok}, ошибок: {fail}.")
 
 
 async def main():
     init_db()
+    # Планировщик: опрос каждый понедельник в 15:00 (МСК)
+    scheduler.add_job(weekly_poll_job, "cron", day_of_week="mon", hour=15, minute=0)
+    scheduler.start()
     print("Bot is running…")
     await dp.start_polling(bot)
 
